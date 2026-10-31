@@ -163,7 +163,7 @@ jobs:
 
   macos:
     name: macOS (app)
-    runs-on: macos-14
+    runs-on: macos-15   # (builds for macOS 14+: see build.sh -target; macos-14 jobs were cancelled at start on 2026-10-31)
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
