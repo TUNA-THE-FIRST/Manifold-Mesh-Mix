@@ -20,7 +20,7 @@ It is made of:
   which were written for the merged engine. The package was called `stl2curves` there and
   was renamed `mms2c` here (its settings `STL2CURVES_*` became `MM_S2C_*`); the merged
   engine as a whole was brought in from the organization's merge repository at its commit
-  ee4e644 (2026-10-30).
+  ade0b31 (2026-10-31).
 
 ## The MIT licence of stl2curves
 
