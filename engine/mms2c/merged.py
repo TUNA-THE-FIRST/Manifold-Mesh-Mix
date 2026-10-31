@@ -1116,6 +1116,12 @@ def _convert_parts(path, out, quality_, report, preset, base):
         "seconds": round(time.time() - t0, 2),
         "input": info.as_dict(),
         "mesh_check": info.mesh_check,
+        # (as pipeline._convert_split sums them up: the apps show these for the whole project)
+        "checked": all(r.get("checked") for r in results),
+        "check_ok": all(r.get("check_ok") for r in results),
+        "checks": [{**i, "message": f"{r['name']}: {i.get('message', '')}"} for r in results for i in r.get("checks") or []],
+        "repaired": mpipe.repair_steps(results),
+        "fidelity": mpipe.fidelity_summary([r["fidelity"] for r in results if r.get("fidelity")]),
     }
     for k in ("solids", "shells", "faces", "edges", "volume", "mesh_volume", "file_size"):
         res[k] = sum(r[k] or 0 for r in results)
