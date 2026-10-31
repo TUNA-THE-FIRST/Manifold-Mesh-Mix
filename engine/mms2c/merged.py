@@ -1017,6 +1017,128 @@ def _entrance(path, out):
     return True, len(tris), float(np.linalg.norm(pts.max(0) - pts.min(0)))
 
 
+class _PartReporter(Reporter):
+    """The reporter for one part of a 3MF project split into parts (_convert_parts): its
+    stages and progress go to the parent's, squeezed into the part's share [lo, hi] and
+    named after the part; its result is kept, not sent (the parent sends a "part" event)."""
+
+    def __init__(self, parent, lo, hi, name):
+        super().__init__(parent.json_mode, parent.quiet, parent.stream)
+        self.t0, self.parent, self.lo, self.hi, self.name, self.res = parent.t0, parent, lo, hi, name, None
+
+    def _emit(self, obj):
+        if obj.get("event") == "result":
+            self.res = obj
+            return
+        if "progress" in obj:
+            obj["progress"] = self.lo + (self.hi - self.lo) * obj["progress"]
+        if obj.get("event") == "stage":
+            obj["stage"] = f"{self.name}: {obj['stage']}"
+        Reporter._emit(self.parent, obj)
+
+
+def _write_stl(path, V, F):
+    """A binary STL of (vertices, triangles)."""
+    T = V[F].astype(np.float32)
+    n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
+    rec = np.zeros(len(F), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
+    rec["n"], rec["v"] = n, T
+    with open(path, "wb") as fh:
+        fh.write(b"Mesh Mix-S2C part".ljust(80, b" "))
+        fh.write(np.uint32(len(F)).tobytes())
+        fh.write(rec.tobytes())
+
+
+def _convert_parts(path, out, quality_, report, preset, base):
+    """A 3MF project split into parts: every part the app lists (MMM's reader, with the
+    app's layout, overlap and touching-parts settings, so the parts and their numbers are the
+    ones the app shows and names files by) converted on its own through the merged engine,
+    one STEP each, as MMM's pipeline does for a split project (pipeline._convert_split).
+    Each part goes in as MMM's mended mesh of it. None when the project has one part (the
+    whole-plate path converts it)."""
+    report = report or NULL
+    t0 = time.time()
+    report.stage("Reading the 3MF project", 0.0, 0.05)
+    bodies, info = mio.load_and_prepare(path, repair=base.repair, remove_debris=base.remove_debris, report=NULL,
+                                        layout=base.layout, merge=base.merge_overlaps, touching=base.touching_parts)
+    if info.parts < 2:
+        return None
+    report.log(f"Split into {info.parts} parts: each is converted on its own with the merged engine")
+    tmp = tempfile.mkdtemp(prefix="mms2c_parts_")
+    used = set(o for o in base.part_outputs if o)
+    results = []
+    try:
+        for p, name in enumerate(info.part_names):
+            shells = [sh for b, bp in zip(bodies, info.body_part) if bp == p for sh in b]
+            if not shells:
+                continue
+            offsets = np.cumsum([0] + [len(sh.V) for sh in shells])
+            V = np.vstack([sh.V for sh in shells])
+            tris = np.vstack([sh.F + o for sh, o in zip(shells, offsets)])
+            src = os.path.join(tmp, f"part{p + 1}.stl")
+            _write_stl(src, V, tris)
+            dest = (base.part_outputs[p] if p < len(base.part_outputs) and base.part_outputs[p]
+                    else mpipe._part_output_path(str(out), name, used))
+            sub = mpipe.Options(**base.__dict__)
+            sub.split, sub.part_outputs, sub.part_previews = False, [], []
+            sub.preview = base.part_previews[p] if p < len(base.part_previews) and base.part_previews[p] else None
+            sub.product_name = name
+            lo, hi = 0.05 + 0.95 * p / info.parts, 0.05 + 0.95 * (p + 1) / info.parts
+            rep = _PartReporter(report, lo, hi, name)
+            t_part = time.time()
+            try:
+                got = convert_file(src, dest, quality_, rep, preset=preset, base=sub) or rep.res or {}
+            except Exception as e:
+                report.warn(f"The part “{name}” couldn't be converted and was left out ({type(e).__name__}: {e}).")
+                continue
+            r = {k: got.get(k) for k in ("preset", "presets", "valid", "solids", "shells", "faces", "edges", "volume",
+                                         "mesh_volume", "file_size", "fidelity", "checked", "check_ok", "checks",
+                                         "repaired")}
+            r.update({"index": len(results), "part": p, "name": name, "output": dest, "preview": sub.preview,
+                      "seconds": round(time.time() - t_part, 2),
+                      "triangles": info.part_triangles[p] if p < len(info.part_triangles) else len(tris)})
+            r["presets"] = r["presets"] or ([r["preset"]] if r["preset"] else [])
+            report.part(r)
+            results.append(r)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not results:
+        raise mpipe.ConversionError("None of the parts could be converted.")
+    presets = [r["preset"] for r in results]
+    res = {
+        "output": results[0]["output"],
+        "outputs": [r["output"] for r in results],
+        "split": True,
+        "parts": results,
+        "preset": presets[0] if all(x == presets[0] for x in presets) else "mixed",
+        "presets": sorted({x for r in results for x in r["presets"]}),
+        "valid": all(r["valid"] is not False for r in results) if base.validate else None,
+        "seconds": round(time.time() - t0, 2),
+        "input": info.as_dict(),
+        "mesh_check": info.mesh_check,
+    }
+    for k in ("solids", "shells", "faces", "edges", "volume", "mesh_volume", "file_size"):
+        res[k] = sum(r[k] or 0 for r in results)
+    report.result(res)
+    return res
+
+
+def _convert_other(path, out, quality_, report, preset, base):
+    """An OBJ, PLY or OFF file through the merged engine (Tuna's choice, 2026-10-31: the new
+    engine for everything): its triangles, as read by MMM's reader, are saved as an STL
+    and converted as one."""
+    tmp = tempfile.mkdtemp(prefix="mms2c_mesh_")
+    try:
+        T = mio.read_any(str(path))
+        src = os.path.join(tmp, os.path.splitext(os.path.basename(str(path)))[0] + ".stl")
+        _write_stl(src, T.reshape(-1, 3), np.arange(3 * len(T)).reshape(-1, 3))
+        sub = mpipe.Options(**(base.__dict__ if base is not None else {}))
+        sub.product_name = sub.product_name or os.path.splitext(os.path.basename(str(path)))[0]
+        return convert_file(src, out, quality_, report, preset=preset, base=sub)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def convert_file(path, out, quality_=None, report=None, preset="auto", base=None):
     """Convert one mesh file with the merged engine into the STEP file out: MMM's result
     dict (faces, validity, how closely it follows the mesh...). preset: "auto" (the
@@ -1025,6 +1147,13 @@ def convert_file(path, out, quality_=None, report=None, preset="auto", base=None
     finding), or MMM's "precise". base: the settings the engine's command line was given
     (mmm.pipeline.Options: unit, tolerance, repair, preview...), which the merged
     pipeline keeps."""
+    if base is not None and base.split and str(path).lower().endswith(PLATE_FORMATS):
+        res = _convert_parts(path, out, quality_, report, preset, base)
+        if res is not None:
+            return res
+    if str(path).lower().endswith(OTHER_FORMATS):
+        return _convert_other(path, out, quality_, report, preset, base)
+
     report = report or Reporter()
     t0 = time.time()
     if quality_ is not None:
