@@ -10,6 +10,8 @@
 # Modified 2026-10-26 for Mesh Mix-S2C: Auto and CAD on an STL go through the merged engine
 # (mms2c/merged.py: stl2curves' features seed this engine's CAD build, raced against
 # both programs alone); --engine mmm keeps this engine's own pipeline.
+# Modified 2026-10-31: a whole 3MF project goes through the merged engine too, laid out as on
+# its plate; a 3MF split into parts still goes through this engine's own pipeline.
 import argparse
 import json
 import os
@@ -122,10 +124,11 @@ def _inspect(args, rep):
 
 
 def _merged(args):
-    """Whether a conversion goes through the merged engine: Auto and CAD on an STL (3MF
-    projects, split into parts, and the Smooth and Precise presets stay this engine's own)."""
+    """Whether a conversion goes through the merged engine: Auto and CAD on an STL or a 3MF
+    project, laid out as on its plate (the owners' choice, 2026-10-30). A 3MF split into
+    parts, OBJ and PLY files, and the Smooth and Precise presets stay this engine's own."""
     return (args.engine == "merged" and args.preset in ("auto", "cad") and not args.split
-            and args.input.lower().endswith(".stl"))
+            and args.input.lower().endswith((".stl", ".3mf")))
 
 
 def main(argv=None):

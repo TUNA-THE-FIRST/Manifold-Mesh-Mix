@@ -46,6 +46,13 @@
 # Modified 2026-10-29 (brace-fit): _straighten_borders' minimum cut also weighs how well each
 # surface fits the triangles it may move (FIT_WEIGHT), not border length only: of equally
 # short borders, the one keeping triangles on the surface they fit better wins.
+# Modified 2026-10-31 (Tuna's side): a flat face made from a region's own triangles that is
+# still broken is built once more from truly coplanar triangles only (FACET_FLAT): grouped
+# within FACET_GROUP of its plane, its corners stood as far off that plane as its edges'
+# tolerance, and the check failed on the tie (Solar Arm Mount was saved faceted for two).
+# Modified 2026-10-31 (Tuna's side): _heal_faces no longer keeps a repair that turns a
+# neighbouring face inside out (HEAL_GROWTH): the edge it hands on can leave a periodic
+# neighbour with everything but its patch (a whole torus round Bravo's motor shaft joint).
 import numpy as np
 
 from OCP.BRep import BRep_Tool
@@ -61,8 +68,9 @@ from OCP.GeomAbs import GeomAbs_C2
 from OCP.GeomAPI import GeomAPI_PointsToBSpline
 from OCP.ShapeFix import ShapeFix_Edge, ShapeFix_Wire
 from OCP.TopAbs import TopAbs_EDGE
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Face, TopoDS_Vertex, TopoDS_Wire
+from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as _ShapeMap
 from OCP.Geom2d import Geom2d_Line
 from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Dir2d, gp_Pnt2d
 from OCP.collections import Array1_gp_Pnt
@@ -80,6 +88,15 @@ AXIS_REACH = 0.05       # share of the model's diagonal, past twice the surface'
 AXIS_NEAREST = 4        # the nearest so many axes in reach are tried for each seed
 AXIS_TIE = 0.9          # a surface on a known axis wins over a free fit covering up to 1 / this as much
 AXIS_SAME_DEG = 0.5     # degrees (and 4 tolerances apart at most): two axes are one
+
+# Flat faces made from a region's own triangles (_flat_facets)
+FACET_GROUP = 0.1       # tolerances: triangles share one flat face when this close to its plane ...
+FACET_FLAT = 1e-3       # ... and only this close when that face broke (a second try, see build_cad_shell)
+
+# Repairing the last broken faces (_heal_faces)
+HEAL_GROWTH = 3.0       # a face this many times the area of its own triangles after a neighbour's repair ...
+HEAL_GROWTH_MM2 = 1.0   # ... and this much more (mm^2) was turned inside out by it
+HEAL_TRIES = 3          # times the repair is run again without the broken faces next to such a face
 
 
 # ----------------------------------------------------------------------------
@@ -3349,11 +3366,29 @@ def build_cad_shell(shell, tol, report=NULL, max_rounds=6, fit_rounds=3, detail=
         if len(_broken_when_saved(asm2, shell=True)) < len(saved) and len(bad2) <= len(bad):
             report.log(f"{len(saved)} face(s) that would be broken in the saved file were built again")
             labels, regions, asm, faces, bad = labels2, regions2, asm2, faces2, bad2
+    # A flat face of a region's own triangles can still be broken: its triangles were grouped
+    # within FACET_GROUP of its plane, so its corners stand off that plane by up to as much as
+    # its edges' tolerance, and the check fails on the tie (Solar Arm Mount: 0.0054 mm against
+    # 0.0054, and the whole part was saved faceted). Those regions are built once more with
+    # only truly coplanar triangles sharing a face (FACET_FLAT): a lone triangle is exactly flat.
+    strict = {r for r, f in asm.region_faces.items()
+              if r < len(regions) and getattr(regions[r].prim, "facet", False)
+              and not BRepCheck_Analyzer(f).IsValid()}
+    if strict:
+        labels2, regions2 = _demote(seg, labels, regions, set(), facet=strict, strict=strict)
+        labels2, regions2, asm2, faces2, bad2 = build(labels2, regions2)
+        if len(bad2) < len(bad):
+            report.log(f"{len(strict)} flat face(s) that still wouldn't build were split into truly flat pieces")
+            labels, regions, asm, faces, bad = labels2, regions2, asm2, faces2, bad2
     if replaced:
         report.log(f"{replaced} surface(s) rebuilt as freeform (B-spline) faces")
     bad_faces = [f for f in faces if not BRepCheck_Analyzer(f).IsValid()]
     if bad_faces:
-        faces = _heal_faces(asm, faces, bad_faces, tol, report)
+        # (the area of each face's own triangles, in the order of faces: the repair must
+        # not turn a face inside out, see _heal_faces)
+        mesh_area = [float(seg.fa[np.asarray(regions[r].faces)].sum()) if r < len(regions) else float("inf")
+                     for r in asm.region_faces]
+        faces = _heal_faces(asm, faces, bad_faces, tol, report, mesh_area)
     return asm, faces, regions
 
 
@@ -3421,34 +3456,60 @@ def _inaccurate_regions(seg, labels, asm, tol, share=0.05, count=3, far_count=No
     return out
 
 
-def _heal_faces(asm, faces, bad_faces, tol, report):
+def _heal_faces(asm, faces, bad_faces, tol, report, mesh_area=None):
     """Repair the few faces that are still invalid with OpenCASCADE's face
     healer. A shared ReShape context propagates any edge it replaces to the
-    neighbouring faces, so the shell stays watertight."""
+    neighbouring faces, so the shell stays watertight.
+
+    That propagation can turn a valid neighbour inside out: on a periodic
+    surface, an edge given back the other way round leaves the neighbour
+    with everything but its patch (Bravo's motor shaft joint: a fillet strip
+    beside a repaired sliver became the whole torus, 696 mm2, 8.3 mm outside
+    the part, and the solid read back inside out). With ``mesh_area`` (the
+    area of each face's own triangles, in the order of ``faces``), a face
+    that comes out more than HEAL_GROWTH times that area, and HEAL_GROWTH_MM2
+    more, is taken as such: the broken faces sharing an edge with it are
+    left unrepaired and the rest are repaired again."""
     try:
         from OCP.BRepCheck import BRepCheck_Analyzer
         from OCP.ShapeBuild import ShapeBuild_ReShape
         from OCP.ShapeFix import ShapeFix_Face
         from OCP.TopAbs import TopAbs_FACE
-        from OCP.TopExp import TopExp_Explorer
 
-        sh = asm.shell_from_faces(faces)
-        ctx = ShapeBuild_ReShape()
-        for f in bad_faces:
-            sff = ShapeFix_Face(f)
-            sff.SetContext(ctx)
-            sff.SetPrecision(max(tol * 0.1, 1e-7))
-            sff.SetMaxTolerance(max(tol * 5, 1e-4))
-            sff.Perform()
-            fixed = sff.Face()
-            if not fixed.IsSame(f):
-                ctx.Replace(f, fixed)
-        healed = ctx.Apply(sh)
-        out = []
-        exp = TopExp_Explorer(healed, TopAbs_FACE)
-        while exp.More():
-            out.append(TopoDS.Face(exp.Current()))
-            exp.Next()
+        def repaired(heal):
+            sh = asm.shell_from_faces(faces)
+            ctx = ShapeBuild_ReShape()
+            for f in heal:
+                sff = ShapeFix_Face(f)
+                sff.SetContext(ctx)
+                sff.SetPrecision(max(tol * 0.1, 1e-7))
+                sff.SetMaxTolerance(max(tol * 5, 1e-4))
+                sff.Perform()
+                fixed = sff.Face()
+                if not fixed.IsSame(f):
+                    ctx.Replace(f, fixed)
+            healed = ctx.Apply(sh)
+            out = []
+            exp = TopExp_Explorer(healed, TopAbs_FACE)
+            while exp.More():
+                out.append(TopoDS.Face(exp.Current()))
+                exp.Next()
+            return out
+
+        heal = list(bad_faces)
+        for _ in range(HEAL_TRIES):
+            out = repaired(heal)
+            grown = _grown_faces(faces, out, mesh_area)
+            if not grown:
+                break
+            left = [f for f in heal if not any(_share_edge(f, faces[i]) for i in grown)]
+            report.log(f"Repairing {len(heal) - len(left)} face(s) turned {len(grown)} neighbour(s) inside out, "
+                       "so those are left as they were")
+            if len(left) == len(heal):
+                return faces
+            heal = left
+        else:
+            return faces
         still = sum(1 for f in out if not BRepCheck_Analyzer(f).IsValid())
         if len(out) >= len(faces) - len(bad_faces) and still < len(bad_faces):
             report.log(f"Repaired {len(bad_faces) - still} of {len(bad_faces)} remaining face(s)")
@@ -3456,6 +3517,39 @@ def _heal_faces(asm, faces, bad_faces, tol, report):
     except Exception as e:
         report.log(f"Automatic face repair was skipped ({e})")
     return faces
+
+
+def _grown_faces(faces, out, mesh_area):
+    """Indices of the faces whose repaired version (same position in ``out``:
+    ShapeBuild_ReShape.Apply keeps the shell's order) is far bigger than their
+    own triangles (_heal_faces). Nothing is found when the counts differ."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    if mesh_area is None or not (len(faces) == len(out) == len(mesh_area)):
+        return []
+    grown = []
+    for i, (f, g) in enumerate(zip(faces, out)):
+        if g.IsSame(f):
+            continue
+        props = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(g, props)
+        area, own = abs(props.Mass()), mesh_area[i]
+        if area > HEAL_GROWTH * own and area > own + HEAL_GROWTH_MM2:
+            grown.append(i)
+    return grown
+
+
+def _share_edge(a, b):
+    """Whether faces a and b share an edge."""
+    edges = _ShapeMap()
+    TopExp.MapShapes_s(a, TopAbs_EDGE, edges)
+    exp = TopExp_Explorer(b, TopAbs_EDGE)
+    while exp.More():
+        if edges.Contains(exp.Current()):
+            return True
+        exp.Next()
+    return False
 
 
 def split_pinched_regions(seg, labels, regions, max_passes=4):
@@ -3712,7 +3806,7 @@ def _settle_tolerances(shape, tol):
         pass
 
 
-def _demote(seg, labels, regions, bad, split_more=False, facet=()):
+def _demote(seg, labels, regions, bad, split_more=False, facet=(), strict=()):
     """Replace regions in ``bad`` by freeform B-spline cells. Tiny ones
     (about the size of the tolerance, too small for a valid face of their
     own) hand their triangles to the neighbouring surface that fits them
@@ -3760,7 +3854,7 @@ def _demote(seg, labels, regions, bad, split_more=False, facet=()):
     for r in rest:
         faces = regions[r].faces if r is not None else np.asarray(pending, dtype=np.int64)
         if r in facet:
-            for cell in _flat_facets(seg, faces):
+            for cell in _flat_facets(seg, faces, flat=FACET_FLAT if r in strict else FACET_GROUP):
                 new_labels[cell.faces] = len(new_regions)
                 new_regions.append(cell)
             continue
@@ -3786,7 +3880,7 @@ def _facets_ok(seg, faces, max_tris=2000, area_k=25.0):
     return 0 < len(faces) <= max_tris and float(seg.fa[faces].mean()) >= area_k * seg.tol ** 2
 
 
-def _flat_facets(seg, faces, max_deg=0.5):
+def _flat_facets(seg, faces, max_deg=0.5, flat=FACET_GROUP):
     """The triangles of ``faces`` as flat faces: neighbouring triangles that
     lie in one plane (within ``max_deg`` and a tenth of the tolerance)
     share a face. Exactly the mesh, so always a faithful last resort."""
@@ -3813,7 +3907,7 @@ def _flat_facets(seg, faces, max_deg=0.5):
                     continue
                 if seg.fn[g] @ n0 < cos_max:
                     continue
-                if np.abs((seg.V[seg.F[g]] - c0) @ n0).max() > 0.1 * seg.tol:
+                if np.abs((seg.V[seg.F[g]] - c0) @ n0).max() > flat * seg.tol:
                     continue
                 group[g] = gid
                 stack.append(int(g))
@@ -3821,7 +3915,11 @@ def _flat_facets(seg, faces, max_deg=0.5):
         comp = np.array(comp, dtype=np.int64)
         P = seg.V[np.unique(seg.F[comp])]
         n = (seg.fn[comp] * seg.fa[comp, None]).sum(0)
-        out.append(Region(Plane(P.mean(0), n if np.linalg.norm(n) > 0 else n0), comp, 1.0, False))
+        cell = Region(Plane(P.mean(0), n if np.linalg.norm(n) > 0 else n0), comp, 1.0, False)
+        cell.facet = True
+        cell.prim.facet = True   # (made from its own triangles; the surface outlives region copies:
+                                 # see build_cad_shell's second try)
+        out.append(cell)
     return out
 
 

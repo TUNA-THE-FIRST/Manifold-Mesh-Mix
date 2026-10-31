@@ -37,6 +37,7 @@ import numpy as np
 
 TOL = 0.001          # mm: CAD exports put mesh corners on the true surface to within this
 FLOAT_TOL = 2e-7     # plus this fraction of the largest coordinate (STL stores 32-bit floats)
+WELD_GRID = 1e-4     # mm: corners on one cell of this grid are joined when the file is read (see load_stl)
 MIRROR = False          # search one side of a mirror-symmetric part, the other by mirroring (off: see CLAUDE.md)
 MIRROR_SHARE = 0.5      # a mirrored surface takes the facets on it if they cover this share of its own area
 NORMAL_DEG = 30      # a facet may tilt this far from the true surface normal (coarse meshes)
@@ -128,16 +129,48 @@ def load_stl(path):
                 raise mio.MeshError("This model's coordinates are too large for stl2curves' reader. "
                                     "Scale it down in the program that made it (it may have been saved "
                                     "in the wrong unit), and export it again.")
-    key = np.round(verts * 1e4).astype(np.int64)
-    uniq, inv = np.unique(key, axis=0, return_inverse=True)
-    pts = np.zeros((len(uniq), 3))
-    pts[inv.ravel()] = verts
-    tris = inv.reshape(-1, 3)
-    tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
+    # corners joined on a WELD_GRID mm grid, which closes the hairline cracks of files that
+    # write a shared corner twice slightly differently (see exact_weld for very fine meshes)
+    pts, tris = _welded(verts, np.round(verts * (1.0 / WELD_GRID)).astype(np.int64))
     if not len(tris):
         raise mio.MeshError("Every triangle in this mesh is squashed flat (or has broken numbers), so there is "
                             "no shape to convert.")
     return pts, tris
+
+
+def exact_weld(path):
+    """(points, triangles) with only identical corners joined, or None unless that leaves a
+    clean closed mesh (no open edge, no edge of three or more triangles). For a mesh finer
+    than WELD_GRID, whose grid weld joins the ends of real edges: Bravo's motor shaft joint
+    (469k triangles across 27 mm, 920 edges under 1e-4 mm) came out of the grid with 42
+    edges of three triangles, 24 still there after repair, so no solid could be closed and
+    the build fell back to 25,488 patches, though the file is watertight as written
+    (2026-10-30). Used only where the repaired grid weld still has such edges (merged.py)."""
+    from mmm import meshio as mio
+    ext = Path(path).suffix.lower()
+    tris = mio.read_any(str(path)) if ext in (".obj", ".ply", ".off") else mio.read_stl(str(path))
+    tris = tris[np.isfinite(tris).all(axis=(1, 2))]
+    verts = tris.reshape(-1, 3)
+    # (identical as stored: the 32-bit floats' bits, with -0 and +0 made one)
+    pts, tris = _welded(verts, (verts.astype(np.float32) + np.float32(0)).view(np.int32).astype(np.int64))
+    return (pts, tris) if len(tris) and not _defects(tris) else None
+
+
+def _welded(verts, key):
+    """(points, triangles): the corners with equal keys joined into one, triangles left
+    without area dropped."""
+    uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    pts = np.zeros((len(uniq), 3))
+    pts[inv.ravel()] = verts
+    tris = inv.reshape(-1, 3)
+    return pts, tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
+
+
+def _defects(tris):
+    """How many edges are open (one triangle) or shared by three or more triangles."""
+    e = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+    _, count = np.unique(e, axis=0, return_counts=True)
+    return int((count == 1).sum() + (count > 2).sum())
 
 
 def _labels(n, a, b):

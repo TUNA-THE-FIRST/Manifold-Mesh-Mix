@@ -60,8 +60,14 @@ RIVALS = os.environ.get("MM_S2C_RIVALS") == "1"
 # 7,934 (+32%; test13 106 -> 407, the hook 154 -> 316) for 5% less time: keep them
 FRONT_BLENDS = os.environ.get("MM_S2C_FRONT_BLENDS") != "0"
 # formats MMM's reader takes on its own (everything else is read as an STL, as before):
-# these go to MMM's pipeline without our front end, as the app sends only STL files here
-OTHER_FORMATS = (".3mf", ".obj", ".ply", ".off")
+# these go to MMM's pipeline without our front end
+OTHER_FORMATS = (".obj", ".ply", ".off")
+# 3MF projects go through our front end like an STL (owners' choice, 2026-10-30): before,
+# they took MMM's path alone and lost every feature (Bravo's skittles nut, a thread, came
+# out as 3,272 freeform faces). The plate is read with our 3MF reader, every object placed
+# and scaled as printed, so the STEP is laid out as on the plate (also the owners' choice;
+# MMM's reader gave each part in its own frame, and a 13-part plate came out in a pile)
+PLATE_FORMATS = (".3mf",)
 # model units across (mm unless chosen otherwise) our front end works within: smaller,
 # its 1e-4 mm weld crushes the shape (a 2 mm sphere came out in 16 faces); larger, its
 # thread search's 0.02 mm bands run away (a 1e8 mm sphere asked for 303 GiB). A model
@@ -671,23 +677,58 @@ class _Route:
         return out
 
 
+def _plate(path):
+    """A 3MF project as (points, triangles, part of each triangle): every object its build
+    prints, placed and scaled as printed (read3mf), each object's parts numbered apart so
+    prepare() mends and builds each on its own (a part's pieces can overlap)."""
+    objects = convert.read_3mf(path)
+    if not objects:
+        raise mio.MeshError("This 3MF project has nothing to print in it, so there's no shape to convert.")
+    pts, tris, part, start, label = [], [], [], 0, 0
+    for _, P, T, L in objects:
+        pts.append(P)
+        tris.append(T + start)
+        part.append(np.asarray(L) + label)
+        start += len(P)
+        label += int(np.max(L)) + 1 if len(L) else 1
+    return np.vstack(pts), np.vstack(tris), np.concatenate(part)
+
+
 def _mended(path, opts, report, route=None):
     """Our prepared parts, on our mended mesh, or on MMM's where ours moved the enclosed
     volume by more than WRECKED and MMM's moved it less (a cap of thin walls: ours split
     4,825 of its 5,196 triangles away as slivers, -19% volume; MMM's kept it whole).
     Returns (parts, info, part, ours): ours, whether they are on our own mended mesh
-    (saved as stages, which our own conversion alongside takes up again)."""
-    parts, info, part = convert.prepare(path, 0.01, blends=FRONT_BLENDS, analyze=route)
-    pts0, tris0 = convert.load_stl(path)
+    (saved as stages, which our own conversion alongside takes up again). Never for a 3MF
+    plate: prepare() gets it as data, which saves no stages, and our own run would convert the
+    whole plate again and write one STEP per object, under names it doesn't look for (found by
+    Duvdivan's Claude in the review of #14)."""
+    plate = str(path).lower().endswith(PLATE_FORMATS)
+    source = _plate(path) if plate else path
+    parts, info, part = convert.prepare(source, 0.01, blends=FRONT_BLENDS, analyze=route)
+    pts0, tris0 = (source[0], source[1]) if plate else convert.load_stl(path)
+    if not plate and any("three or more" in s for s in info.get("mesh_left") or []):
+        # (edges of three or more triangles our repair couldn't remove: no solid closes there.
+        # On a mesh finer than the weld grid they can be the grid's doing; read with only its
+        # identical corners joined, if that is clean: see features.exact_weld)
+        exact = F.exact_weld(path)
+        if exact is not None:
+            report.log("The mesh is finer than stl2curves' corner weld, which joined corners that should stay apart, "
+                       "so it is read again with only its identical corners joined")
+            parts, info2, part = convert.prepare(exact, 0.01, blends=FRONT_BLENDS, analyze=route)
+            info2["triangles"] = info["triangles"]
+            info = info2
+            pts0, tris0 = exact
     raw = abs(_signed_volume(pts0, tris0))
     mine = abs(sum(_signed_volume(p[0].pts, p[0].body_tris) for p in parts))
     if not raw or abs(mine - raw) <= WRECKED * raw:
-        return parts, info, part, True
-    theirs_bodies, _ = mio.load_and_prepare(path, repair=opts.repair, remove_debris=opts.remove_debris, report=NULL)
+        return parts, info, part, not plate
+    theirs_bodies, _ = mio.load_and_prepare(path, repair=opts.repair, remove_debris=opts.remove_debris, report=NULL,
+                                            **({"layout": "plate"} if plate else {}))
     shells = [s for b in theirs_bodies for s in b]
     theirs = abs(sum(s.volume for s in shells))
     if abs(theirs - raw) >= abs(mine - raw):
-        return parts, info, part, True
+        return parts, info, part, not plate
     report.log(f"stl2curves' repair moved the enclosed volume {100 * (mine - raw) / raw:+.1f}%, MMM's "
                f"{100 * (theirs - raw) / raw:+.1f}%: MMM's mended mesh is used, stl2curves' features found on it")
     offsets = np.cumsum([0] + [len(s.V) for s in shells])
@@ -729,7 +770,7 @@ class _NothingLeft(mio.MeshError):
 
 def _front(path, opts, report):
     if str(path).lower().endswith(OTHER_FORMATS):
-        # (3MF projects: MMM's own reader and segmentation, for now)
+        # (OBJ, PLY and OFF: MMM's own reader and segmentation, for now)
         bodies, info = mio.load_and_prepare(path, repair=opts.repair, remove_debris=opts.remove_debris,
                                             report=report, layout=opts.layout, merge=opts.merge_overlaps,
                                             touching=opts.touching_parts)
@@ -953,6 +994,16 @@ def _entrance(path, out):
     mpipe.check_paths(path, out)
     if str(path).lower().endswith(OTHER_FORMATS):
         return False, 0, None
+    if str(path).lower().endswith(PLATE_FORMATS):
+        try:
+            pts, tris, _ = _plate(path)
+        except (mio.MeshError, OSError, MemoryError):
+            raise
+        except Exception as e:
+            raise mio.MeshError(f"This 3MF project seems to be damaged, so it couldn't be read ({type(e).__name__}). "
+                                "Try saving it again.") from e
+        mio.check_triangles(pts[tris].astype(np.float32))
+        return True, len(tris), float(np.linalg.norm(pts.max(0) - pts.min(0)))
     try:
         tris = mio.read_stl(str(path))
     except (mio.MeshError, OSError, MemoryError):
@@ -993,7 +1044,8 @@ def convert_file(path, out, quality_=None, report=None, preset="auto", base=None
     # MMM's engine alone from the start, and our own conversion once our first stages are
     # saved (see _OurRun): rivals to the merged result (see rivals.py). (3MF projects go
     # to MMM's own reader unseeded, so MMM alone would only repeat them.)
-    if use:
+    # (not for a 3MF plate: MMM alone would read it in its parts' own frames)
+    if use and not str(path).lower().endswith(PLATE_FORMATS):
         _running.append(rivals.MMMAlone(path, q))
     judges = rivals.Judges(path, _running)
     opts = mpipe.Options(**(base.__dict__ if base is not None else {}))
